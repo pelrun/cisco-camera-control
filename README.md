@@ -8,7 +8,7 @@ My contribution was guiding the LLM to run a few experiments to capture packets 
 
 I do not know how well this code will work with a new camera, but I have tried it with 3 cameras that all seem to respond well to the PTZ commands, and I've had one camera set up that's maintained its PTZ control and video stream over a multi-week session.
 
-The cost incurred for this project was ~$100, incl. hardware and Claude Code credits. The real value capture is (hopefully) in getting a kickass PTZ camera for $15/each instead of $X00 & saving tons of perfectly functional cameras from e-waste. [Tip jar](https://ko-fi.com/ajaksalad) if you're feeling generous. 
+The cost incurred for this project was ~$100, incl. hardware and Claude Code credits. The real value capture is (hopefully) in getting a kickass PTZ camera for $15/each instead of $X00 & saving tons of perfectly functional cameras from e-waste. [Tip jar](https://ko-fi.com/ajaksalad) if you're feeling generous.
 
 ## Description
 
@@ -40,6 +40,13 @@ sure — start here. After this it'll trust the codec identity baked into
 # wait ~3 minutes; camera reboots and gets a new DHCP lease
 ```
 
+If the camera only has an IPv6 link-local address (for example in the Pi bridge
+setup with codec offline), provide the scoped address with an interface suffix:
+
+```bash
+./provision.py fe80::277:8dff:fe90:343a%br0
+```
+
 The camera will likely come back on a **different IP** after rebooting
 (its old DHCP lease lapses). Scan for it:
 
@@ -62,6 +69,12 @@ with concurrent.futures.ThreadPoolExecutor(64) as ex:
 # open http://localhost:8080 in a browser
 ```
 
+IPv6 link-local targets are also supported:
+
+```bash
+./server.py --camera fe80::277:8dff:fe90:343a%br0 --port 8081
+```
+
 The web UI is a single page with pan/tilt/zoom number inputs. Hit "Go" to send
 an absolute `PositionSet` command.
 
@@ -71,10 +84,13 @@ an absolute `PositionSet` command.
 |----------|--------|------|---------|
 | `/` | GET | — | Web UI |
 | `/position` | POST | `{"pan": -10000..10000, "tilt": -2500..2500, "zoom": 1000..8000}` | Absolute position |
-| `/status` | GET | — | `{"connected": bool, "last_pos": {...}}` |
+| `/focus` | POST | `{"value": ...}` | Scaffolded endpoint for future focus control; returns `501` until a captured frame is added |
+| `/brightness` | POST | `{"value": ...}` | Scaffolded endpoint for future brightness control; returns `501` until a captured frame is added |
+| `/status` | GET | — | `{"connected": bool, "last_pos": {...}, "last_control": {...}}` |
 
 `pan` and `tilt` units are XAPI (1/100 of a degree).
 `zoom` is counterintuitive: lower = telephoto, higher = wide angle.
+`focus` and `brightness` are wired into the server API surface, but their DORIC command frames have not been captured yet.
 
 ## How it works (brief)
 
@@ -84,7 +100,7 @@ handshake the codec sends a 143-byte DORIC banner containing its identity
 command frames are all in this codebase.
 
 `provision.py` replays a complete captured codec session — including ~42 MB
-of firmware/peripheral package (`halley.pk`) — which:
+of firmware/peripheral package (`halley.pkg`) — which:
 1. Updates the camera's firmware to HC9.15.0.11 if needed
 2. Installs the captured codec's identity as the camera's trust anchor
 

@@ -4,6 +4,7 @@ Minimal control server for a Cisco TTC8-07 / Precision HD camera.
 
 Usage:
     ./server.py --camera 10.0.0.93 [--port 8080]
+    ./server.py --camera fe80::277:8dff:fe90:343a%br0 [--port 8080]
 
 Opens a DORIC session to the camera and exposes a tiny HTTP API:
 
@@ -57,22 +58,36 @@ class Camera:
         self.alive    = True
         self.send_q   = queue.Queue()
         self.last_pos = {'pan': None, 'tilt': None, 'zoom': None, 'ts': 0.0}
+        self.last_control = {'name': None, 'value': None, 'ts': 0.0}
 
     def _tls_connect(self):
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode    = ssl.CERT_NONE
         ctx.set_ciphers('ALL:@SECLEVEL=0')
-        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw.settimeout(5)
-        raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  10)
-        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,   3)
-        raw.connect((self.ip, DORIC_PORT))
-        c = ctx.wrap_socket(raw, server_hostname=self.ip)
-        c.setblocking(False)
-        return c
+        infos = socket.getaddrinfo(self.ip, DORIC_PORT, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+        last_err = None
+        for family, socktype, proto, _canonname, sockaddr in infos:
+            raw = socket.socket(family, socktype, proto)
+            raw.settimeout(5)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE,  10)
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT,   3)
+            try:
+                raw.connect(sockaddr)
+                # SNI does not support scope zone IDs like %br0.
+                server_name = self.ip.split('%', 1)[0]
+                c = ctx.wrap_socket(raw, server_hostname=server_name)
+                c.setblocking(False)
+                return c
+            except Exception as e:
+                last_err = e
+                try:
+                    raw.close()
+                except Exception:
+                    pass
+        raise last_err if last_err is not None else RuntimeError('unable to resolve/connect to camera target')
 
     def _rd(self, c, timeout=2.0):
         buf = b''; deadline = time.time() + timeout
@@ -162,6 +177,20 @@ class Camera:
         self.send_q.put(frame)
         self.last_pos = {'pan': pan, 'tilt': tilt, 'zoom': zoom, 'ts': time.time()}
 
+    def send_control(self, name, frame, value):
+        if self.conn is None:
+            raise RuntimeError('camera not connected')
+        self.send_q.put(frame)
+        self.last_control = {'name': name, 'value': value, 'ts': time.time()}
+
+
+def build_focusset(value):
+    raise NotImplementedError('focus command framing is not captured yet')
+
+
+def build_brightnessset(value):
+    raise NotImplementedError('brightness command framing is not captured yet')
+
 # ── HTTP server ───────────────────────────────────────────────────────────────
 
 INDEX_HTML = b'''<!DOCTYPE html>
@@ -227,28 +256,40 @@ def make_handler(camera):
                 body = json.dumps({
                     'connected': camera.conn is not None,
                     'last_pos':  camera.last_pos,
+                    'last_control': camera.last_control,
                 }).encode()
                 self._send(200, body, 'application/json')
             else:
                 self._send(404, b'not found')
 
         def do_POST(self):
-            if self.path != '/position':
-                self._send(404, b'not found'); return
             try:
                 n = int(self.headers.get('Content-Length', 0))
                 data = json.loads(self.rfile.read(n))
-                camera.goto(data['pan'], data['tilt'], data['zoom'])
-                self._send(200, b'ok')
+                if self.path == '/position':
+                    camera.goto(data['pan'], data['tilt'], data['zoom'])
+                    self._send(200, b'ok')
+                elif self.path == '/focus':
+                    frame = build_focusset(data['value'])
+                    camera.send_control('focus', frame, data['value'])
+                    self._send(200, b'ok')
+                elif self.path == '/brightness':
+                    frame = build_brightnessset(data['value'])
+                    camera.send_control('brightness', frame, data['value'])
+                    self._send(200, b'ok')
+                else:
+                    self._send(404, b'not found')
             except RuntimeError as e:
                 self._send(503, str(e).encode())
+            except NotImplementedError as e:
+                self._send(501, str(e).encode())
             except Exception as e:
                 self._send(400, f'{type(e).__name__}: {e}'.encode())
     return H
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--camera', required=True, help='camera IP address')
+    ap.add_argument('--camera', required=True, help='camera IP/IPv6 target (for link-local use %%iface, e.g. fe80::1%%br0)')
     ap.add_argument('--port',   type=int, default=8080, help='HTTP port (default 8080)')
     args = ap.parse_args()
 

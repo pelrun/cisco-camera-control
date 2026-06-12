@@ -3,7 +3,7 @@
 Provision a Cisco TTC8-07 camera by replaying a captured codec session.
 
 Usage:
-    ./provision.py <camera_ip>
+    ./provision.py <camera_addr>
 
 Reads cppmf_session.bin and doric_session.bin from ./data/ and streams them
 to the camera over TLS. Effectively impersonates the codec that was captured,
@@ -22,15 +22,29 @@ DATA_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
 def log(label, msg):
     print(f'[{time.strftime("%H:%M:%S")}] [{label}] {msg}', flush=True)
 
-def tls_connect(ip, port):
+def tls_connect(target, port):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode    = ssl.CERT_NONE
     ctx.set_ciphers('ALL:@SECLEVEL=0')
-    raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    raw.settimeout(10)
-    raw.connect((ip, port))
-    return ctx.wrap_socket(raw, server_hostname=ip)
+
+    infos = socket.getaddrinfo(target, port, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
+    last_err = None
+    for family, socktype, proto, _canonname, sockaddr in infos:
+        raw = socket.socket(family, socktype, proto)
+        raw.settimeout(10)
+        try:
+            raw.connect(sockaddr)
+            # SNI does not support scope zone IDs like %br0.
+            server_name = target.split('%', 1)[0]
+            return ctx.wrap_socket(raw, server_hostname=server_name)
+        except Exception as e:
+            last_err = e
+            try:
+                raw.close()
+            except Exception:
+                pass
+    raise last_err if last_err is not None else RuntimeError('unable to resolve/connect to camera target')
 
 def drain(sock, label, stop_evt):
     """Read replies from camera into the void (just to keep TCP flowing)."""
@@ -51,16 +65,16 @@ def drain(sock, label, stop_evt):
             return
     log(label, f'drained {total}B from camera')
 
-def replay(ip, port, fname, label, settle_secs):
+def replay(target, port, fname, label, settle_secs):
     path = os.path.join(DATA_DIR, fname)
     if not os.path.exists(path):
         log(label, f'MISSING DATA FILE: {path}')
         return
     with open(path, 'rb') as f:
         data = f.read()
-    log(label, f'connecting {ip}:{port}')
+    log(label, f'connecting {target}:{port}')
     try:
-        c = tls_connect(ip, port)
+        c = tls_connect(target, port)
     except Exception as e:
         log(label, f'TLS connect FAILED: {type(e).__name__}: {e}')
         return
@@ -91,18 +105,18 @@ def replay(ip, port, fname, label, settle_secs):
 def main():
     if len(sys.argv) != 2:
         print(__doc__); sys.exit(1)
-    ip = sys.argv[1]
-    log('main', f'==> provisioning {ip}')
+    target = sys.argv[1]
+    log('main', f'==> provisioning {target}')
     log('main', 'this takes ~2 minutes and the camera will reboot when done')
 
     cppmf_t = threading.Thread(
         target=replay,
-        args=(ip, CPPMF_PORT, 'cppmf_session.bin', 'cppmf', 120),
+        args=(target, CPPMF_PORT, 'cppmf_session.bin', 'cppmf', 120),
         daemon=True,
     )
     cppmf_t.start()
     time.sleep(2)  # let CPPMF establish first
-    replay(ip, DORIC_PORT, 'doric_session.bin', 'doric', settle_secs=30)
+    replay(target, DORIC_PORT, 'doric_session.bin', 'doric', settle_secs=30)
     log('main', 'replay complete. wait ~60s for reboot, then test with server.py')
 
 if __name__ == '__main__':
